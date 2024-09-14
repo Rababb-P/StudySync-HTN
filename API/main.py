@@ -112,7 +112,7 @@ class Question:
 
 
 
-co = cohere.Client("7dtn4TcEcvvcYtxjAmCqqU5eXg12PqgcoTwzjf5Y")
+co = cohere.Client("")
 
 
 """
@@ -271,99 +271,176 @@ def start_transcription(temp_file_path):
 ########################
 
 
-import cv2
-import requests
-import io
 import os
+import io
+import cv2
+import time
+import tempfile
+import requests
+from typing import Optional
 
-def transcribe(video_chunk):
-    # API URL
-    url = "https://symphoniclabs--symphonet-vsr-modal-htn-model-upload-static-htn.modal.run"
-
-    # Convert video chunk to BytesIO
-    video_io = io.BytesIO(video_chunk)
-
-    # Send POST request with the video chunk
-    response = requests.post(url, files={'video': ('input.mp4', video_io, 'video/mp4')})
-    print(response.text)
-    
-    # Return the transcription result
-    return response.text
+API_URL_DEFAULT = "https://symphoniclabs--symphonet-vsr-modal-htn-model-upload-static-htn.modal.run"
+API_URL = os.getenv("SYMPHONIC_API_URL", API_URL_DEFAULT)
 
 
+def transcribe_bytes(video_bytes: bytes, *, timeout: int = 120) -> str:
+    """
+    Send raw MP4 bytes to the transcription API and return the raw response text.
+    """
+    if not video_bytes:
+        raise ValueError("video_bytes is empty")
 
-# Assuming video.mp4 exists
-
-def balls(file_path):
- 
-    url = "https://symphoniclabs--symphonet-vsr-modal-htn-model-upload-static-htn.modal.run"
-
-    with open(file_path, 'rb') as video_file:
-        video = io.BytesIO(video_file.read())
-
-    response = requests.post(url, files={'video': ('input.mp4', video, 'video/mp4')})
-    bullet_points = text_to_bullet_list(response)
-
-    return jsonify({'transcript': response,'bulletpoints':bullet_points})
+    files = {"video": ("input.mp4", io.BytesIO(video_bytes), "video/mp4")}
+    try:
+        resp = requests.post(API_URL, files=files, timeout=timeout)
+        resp.raise_for_status()
+        return resp.text
+    except requests.RequestException as e:
+        # Keep it commit-safe (no secrets), but still informative.
+        return f"[error] request to API failed: {e}"
 
 
-#print(balls("test.mp4"))
+def transcribe_file(file_path: str, *, timeout: int = 120) -> str:
+    """
+    Read an MP4 file from disk and send it to the transcription API.
+    """
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"No such file: {file_path}")
 
-def capture_and_transcribe_live():
-    # OpenCV video capture
-    cap = cv2.VideoCapture(1)  # 0 is usually the default webcam
+    with open(file_path, "rb") as f:
+        return transcribe_bytes(f.read(), timeout=timeout)
 
-    # Check if webcam opened successfully
+
+def capture_and_transcribe_live(
+    camera_index: int = 0,
+    chunk_duration_sec: float = 4.0,
+    frame_rate: int = 60,
+    show_window: bool = True,
+    stop_key: str = "q",
+) -> None:
+    """
+    Capture webcam video in fixed-size chunks and send each chunk to the API.
+
+    Press the `stop_key` while the display window is focused to exit.
+    """
+    cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        print("Error: Could not open webcam.")
+        print("[error] Could not open webcam.")
         return
 
-    # Codec and chunk properties
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # mp4 format
-    chunk_duration = 4  # seconds of video per chunk
-    frame_rate = 60  # Frames per second (FPS)
+    # Probe a first frame to size the writer correctly
+    ret, frame = cap.read()
+    if not ret:
+        print("[error] Could not read initial frame.")
+        cap.release()
+        return
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Error: Could not read frame.")
-            break
+    h, w = frame.shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    total_frames = max(1, int(chunk_duration_sec * frame_rate))
 
-        # Display the webcam feed
-        cv2.imshow('Webcam Feed', frame)
+    print(f"[info] Using API_URL={API_URL}")
+    print(f"[info] Capturing {total_frames} frames per chunk at {frame_rate} FPS ({chunk_duration_sec}s).")
+    print(f"[info] Press '{stop_key}' to stop.")
 
-        # Save the video chunk
-        chunk_file = "temp_chunk.mp4"
-        out = cv2.VideoWriter(chunk_file, fourcc, frame_rate, (frame.shape[1], frame.shape[0]))
-        frame_count = 0
-        total_frames = int(chunk_duration * frame_rate)
+    try:
+        while True:
+            # Optional live preview
+            if show_window:
+                cv2.imshow("Webcam Feed", frame)
+                # Non-blocking check for stop key
+                if cv2.waitKey(1) & 0xFF == ord(stop_key):
+                    break
 
-        # Write frames to file for a specified duration (chunk_duration)
-        while frame_count < total_frames:
+            # Record a chunk
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(prefix="chunk_", suffix=".mp4", delete=False) as tmp:
+                    tmp_path = tmp.name
+
+                out = cv2.VideoWriter(tmp_path, fourcc, frame_rate, (w, h))
+                frames_written = 0
+
+                # We already have one frame in `frame`; include it for snappier chunk start
+                out.write(frame)
+                frames_written += 1
+
+                while frames_written < total_frames:
+                    ret, frame = cap.read()
+                    if not ret:
+                        print("[warn] Could not read frame; ending capture loop.")
+                        break
+                    out.write(frame)
+                    frames_written += 1
+
+                out.release()
+
+                # Send the chunk
+                with open(tmp_path, "rb") as f:
+                    chunk_bytes = f.read()
+
+                started = time.time()
+                transcription = transcribe_bytes(chunk_bytes)
+                elapsed = time.time() - started
+
+                print("\n======= TRANSCRIPTION RESULT =======")
+                print(transcription.strip() or "[empty response]")
+                print(f"============= ({elapsed:.2f}s) =============\n")
+
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+
+            # Grab next frame to keep the preview fresh
             ret, frame = cap.read()
             if not ret:
+                print("[warn] Could not read frame after chunk; stopping.")
                 break
-            out.write(frame)
-            frame_count += 1
 
-        out.release()  # Save the chunk
-        
-        # Send video chunk to transcription API
-        with open(chunk_file, 'rb') as f:
-            video_chunk = f.read()
-            transcription = transcribe(video_chunk)
-            print("Transcription:", transcription)
+    except KeyboardInterrupt:
+        print("\n[info] Interrupted by user.")
+    finally:
+        cap.release()
+        if show_window:
+            cv2.destroyAllWindows()
 
-        # Delete the temporary video chunk file
-        os.remove(chunk_file)
 
-        # Break loop when 'q' is pressed
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+if __name__ == "__main__":
+    import argparse
 
-    # Release the webcam and close OpenCV windows
-    cap.release()
-    cv2.destroyAllWindows()
+    parser = argparse.ArgumentParser(description="Chunked webcam transcription to Symphonic API.")
+    sub = parser.add_subparsers(dest="cmd", required=False)
+
+    # File mode
+    p_file = sub.add_parser("file", help="Transcribe an existing MP4 file.")
+    p_file.add_argument("path", help="Path to an MP4 file.")
+
+    # Live mode
+    p_live = sub.add_parser("live", help="Capture webcam and transcribe in chunks.")
+    p_live.add_argument("--camera", type=int, default=0, help="Camera index (default 0).")
+    p_live.add_argument("--chunk", type=float, default=4.0, help="Chunk duration in seconds (default 4).")
+    p_live.add_argument("--fps", type=int, default=60, help="Frames per second (default 60).")
+    p_live.add_argument("--no-window", action="store_true", help="Disable preview window.")
+    p_live.add_argument("--stop-key", default="q", help="Key to stop (default 'q').")
+
+    args = parser.parse_args()
+
+    if args.cmd == "file":
+        print(transcribe_file(args.path))
+    else:
+        # Default to live mode if no subcommand provided
+        capture_and_transcribe_live(
+            camera_index=getattr(args, "camera", 0),
+            chunk_duration_sec=getattr(args, "chunk", 4.0),
+            frame_rate=getattr(args, "fps", 60),
+            show_window=not getattr(args, "no_window", False),
+            stop_key=getattr(args, "stop_key", "q"),
+        )
+
+
 
 
 # Run the live transcription
