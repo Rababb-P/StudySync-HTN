@@ -9,7 +9,7 @@ const app = express();
 const port = 3001;
 
 // Connection URL
-const url = 'mongodb+srv://vidsterbroyo:VoeyVtqp750W39aR@studybuddymongo.ny5sq.mongodb.net/?retryWrites=true&w=majority&appName=StudyBuddyMongo';
+    const url = MONGO DB URL HERE;
 const dbName = 'StudyGroupLectures';
 
 // Middleware to parse JSON
